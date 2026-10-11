@@ -23,7 +23,10 @@ Discord ──▶ bot (HeilandBay, /mnt/apps/discord-summary/stack)
 Summaries are a **topic outline**: a bold topic line naming who was in it, then
 short bullets, with sub-bullets for details. The bot normalises whatever the
 model emits into that shape. A window inside one calendar day gets a single summary. Anything longer gets
-**one section per day**, posted as each finishes. The header (message count,
+**one section per day**, posted as each finishes. Private multi-day summaries
+go to your **DMs** so they don't clog the channel (and DMs aren't bound by
+Discord's 15-minute reply limit). If your DMs from server members are off, the
+summary falls back to the channel, visible only to you. The header (message count,
 span, who was talking) and the `processed in` footer come from the bot, not the
 model.
 

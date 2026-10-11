@@ -273,8 +273,34 @@ async def run_summary(interaction, rec, since, hours, days, count, big, public) 
             await send("hyperBox is offline or asleep, so I can't summarise "
                        "right now. Try again later.", ephemeral=True)
             return "hyperbox_offline"
+
+        # Private multi-day summaries go to DMs: several sections clog the channel
+        # even when only you can see them. DMs also escape the 15-minute followup
+        # limit. Falls back to the channel if the user has server DMs turned off.
+        dm = None
+        rec["delivery"] = "channel" if public else "ephemeral"
+        if len(groups) > 1 and not public:
+            where = getattr(interaction.channel, "jump_url", "")
+            try:
+                dm = await interaction.user.create_dm()
+                await dm.send(f"{head}\n-# {len(groups)} days from {where} - one section "
+                              "per day, posted as each finishes")
+                rec["delivery"] = "dm"
+                await send(f"Sending this one to your DMs - {len(groups)} days, one "
+                           "section each.", ephemeral=True)
+            except discord.HTTPException:   # Forbidden = DMs from server members off
+                dm = None
+                rec["delivery"] = "dm_blocked"
+                await send("-# Couldn't DM you (your privacy settings block it), so "
+                           "it's going here instead.", ephemeral=True)
+
+        async def post(text, error=False):
+            if dm:
+                await dm.send(text)
+            else:
+                await send(text, ephemeral=error or not public)
         if llm_lock.locked():
-            await send("Another summary is running - you're next.", ephemeral=True)
+            await post("Another summary is running - you're next.", error=True)
         async with llm_lock:
             try:
                 if len(groups) == 1:
@@ -282,14 +308,15 @@ async def run_summary(interaction, rec, since, hours, days, count, big, public) 
                     body = await summarise(session, model, "\n".join(lines))
                     sections = [f"{head}\n\n{body}"]
                 else:
-                    await send(f"{head}\n-# {len(groups)} days - one section per day, "
-                               "posted as each finishes", ephemeral=not public)
+                    if not dm:
+                        await post(f"{head}\n-# {len(groups)} days - one section per day, "
+                                   "posted as each finishes")
                     sections = []
                     for i, (day, day_msgs) in enumerate(groups):
-                        if time.monotonic() - t0 > DEADLINE - 90:
-                            await send(f"-# Stopped before {day:%a %b %-d} - Discord only "
+                        if not dm and time.monotonic() - t0 > DEADLINE - 90:
+                            await post(f"-# Stopped before {day:%a %b %-d} - Discord only "
                                        "allows a reply 15 minutes to finish. Ask for a "
-                                       "shorter window to get the rest.", ephemeral=not public)
+                                       "shorter window to get the rest.")
                             rec["days_done"] = i
                             return "deadline"
                         lines, d = fit([describe(m) for m in day_msgs])
@@ -297,30 +324,30 @@ async def run_summary(interaction, rec, since, hours, days, count, big, public) 
                         body = await summarise(session, model, "\n".join(lines), limit=900)
                         text = f"### {day:%a %b %-d} · {len(day_msgs)} messages\n{body}"
                         for p in chunks(text):
-                            await send(p, ephemeral=not public)
+                            await post(p)
                     rec["days_done"] = len(groups)
             except asyncio.TimeoutError:
-                await send("hyperBox took too long - try a shorter window, "
-                           "or without `big`.", ephemeral=True)
+                await post("hyperBox took too long - try a shorter window, "
+                           "or without `big`.", error=True)
                 return "timeout"
             except aiohttp.ClientError as e:
                 log.exception("ollama call failed")
-                await send(f"hyperBox returned an error: {e}", ephemeral=True)
+                await post(f"hyperBox returned an error: {e}", error=True)
                 return "llm_error"
 
-    rec["dropped"] = dropped
-    secs = round(time.monotonic() - t0)
-    took = f"{secs}s" if secs < 60 else f"{secs // 60}m {secs % 60}s"
-    note = f"-# {model} · processed in {took}"
-    if dropped:
-        note += f" · oldest {dropped} messages of a very long day skipped"
-    if sections:
-        sections[-1] += "\n" + note
-    else:
-        sections = [note]
-    for text in sections:
-        for p in chunks(text):
-            await send(p, ephemeral=not public)
+        rec["dropped"] = dropped
+        secs = round(time.monotonic() - t0)
+        took = f"{secs}s" if secs < 60 else f"{secs // 60}m {secs % 60}s"
+        note = f"-# {model} · processed in {took}"
+        if dropped:
+            note += f" · oldest {dropped} messages of a very long day skipped"
+        if sections:
+            sections[-1] += "\n" + note
+        else:
+            sections = [note]
+        for text in sections:
+            for p in chunks(text):
+                await post(p)
     return "ok"
 
 
