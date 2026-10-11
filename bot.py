@@ -16,7 +16,10 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
+import random
+
 from discord import app_commands
+from discord.ext import tasks
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://192.168.0.208:11434").rstrip("/")
@@ -62,6 +65,36 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 llm_lock = asyncio.Lock()
 active = 0              # summaries in progress - SIGTERM waits for these
+
+# Rotating custom statuses. Edit freely - one is picked every STATUS_EVERY minutes.
+STATUS_EVERY = 15
+STATUSES = [
+    "vibing in a hot spring 🧖",
+    "chilling with a yuzu on my head 🍊",
+    "friends with literally everyone",
+    "too chill to have opinions",
+    "reading the backlog so you don't have to",
+    "tl;dr-ing your drama",
+    "scrolling up... still scrolling up...",
+    "skimming 1,705 messages, judging none",
+    "counting messages (the AI can't)",
+    "fact-checking nobody, verify me 🫡",
+    "running on a local LLM, not the cloud ☁️🚫",
+    "powered by hyperBox and snacks",
+    "waiting for scarlett to get out of bed",
+    "brewing pumpkin spice for the group",
+    "/summary me, cap'n",
+    "capybara-certified recaps",
+    "chewing on a nice reed 🌾",
+    "sitting peacefully while chaos unfolds",
+    "accepting head scritches",
+    "in a group cuddle with some ducks 🦆",
+]
+BUSY_STATUSES = [
+    "summarising... don't rush a capybara",
+    "reading so you don't have to 📖",
+    "chewing through the backlog 🌾",
+]
 shutting_down = False
 
 
@@ -205,6 +238,7 @@ async def summary(interaction: discord.Interaction, since: str | None = None,
             "I'm restarting for an update - try again in a minute.", ephemeral=True)
         return
     active += 1
+    await set_status(random.choice(BUSY_STATUSES))
     rec = dict(ts=dt.datetime.now(TZ).isoformat(timespec="seconds"),
                user=interaction.user.name, guild=getattr(interaction.guild, "name", None),
                channel=getattr(interaction.channel, "name", None),
@@ -226,6 +260,8 @@ async def summary(interaction: discord.Interaction, since: str | None = None,
         except OSError:
             log.exception("couldn't write %s", USAGE_LOG)
         active -= 1
+        if not active:
+            await set_status(random.choice(STATUSES))
 
 
 def by_day(msgs: list[discord.Message]) -> list[tuple[dt.date, list[discord.Message]]]:
@@ -373,6 +409,21 @@ async def on_ready():
     else:
         await tree.sync()
     log.info("logged in as %s, ollama at %s", client.user, OLLAMA_URL)
+    if not rotate_status.is_running():
+        rotate_status.start()
+
+
+async def set_status(text: str):
+    try:
+        await client.change_presence(activity=discord.CustomActivity(name=text))
+    except Exception:       # cosmetic - never let a status break a summary
+        log.exception("couldn't set status")
+
+
+@tasks.loop(minutes=STATUS_EVERY)
+async def rotate_status():
+    if not active:          # leave the busy status alone mid-summary
+        await set_status(random.choice(STATUSES))
 
 
 async def drain_and_close():
