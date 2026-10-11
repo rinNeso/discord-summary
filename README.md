@@ -29,6 +29,9 @@ Discord's 15-minute reply limit). If your DMs from server members are off, the
 summary falls back to the channel, visible only to you. The header (message count,
 span, who was talking) and the `processed in` footer come from the bot, not the
 model.
+Every summary ends with a disclaimer that it's AI-generated and should be
+checked against the chat. The benchmark below is why: misattribution is the
+models' most common error.
 
 ## Deploy
 
@@ -53,6 +56,10 @@ permissions `68608` (view channels, send messages, read history). The bot needs
 hyperBox side, tracked in `hyperbox-hw`: `OLLAMA_HOST=0.0.0.0:11434` in the
 ollama override, plus `ufw allow proto tcp from 192.168.0.69 to any port 11434`.
 Ollama has no auth, so that rule is the only gate. `check.sh` asserts it.
+
+Redeploying is safe mid-summary. On SIGTERM the bot refuses new commands
+("restarting, try again in a minute"), waits for running summaries to finish,
+then exits. `stop_grace_period: 16m` gives it room.
 
 ## Usage stats
 

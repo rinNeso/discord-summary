@@ -7,6 +7,7 @@ services:
     image: discord-summary:local
     container_name: discord-summary
     restart: unless-stopped
+    stop_grace_period: 16m   # bot finishes running summaries on SIGTERM; a DM week can take ~6 min
     env_file: /mnt/apps/discord-summary/secrets/.env   # DISCORD_TOKEN, GUILD_ID - root-only
     environment:
       TZ: America/Chicago

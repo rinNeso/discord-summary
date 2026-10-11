@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import signal
 import time
 from collections import Counter
 from zoneinfo import ZoneInfo
@@ -60,6 +61,8 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 llm_lock = asyncio.Lock()
+active = 0              # summaries in progress - SIGTERM waits for these
+shutting_down = False
 
 
 def parse_since(text: str) -> dt.datetime:
@@ -196,6 +199,12 @@ async def summary(interaction: discord.Interaction, since: str | None = None,
                   days: app_commands.Range[int, 1, 7] | None = None,
                   count: app_commands.Range[int, 1, MAX_COUNT] | None = None,
                   big: bool = False, public: bool = False):
+    global active
+    if shutting_down:
+        await interaction.response.send_message(
+            "I'm restarting for an update - try again in a minute.", ephemeral=True)
+        return
+    active += 1
     rec = dict(ts=dt.datetime.now(TZ).isoformat(timespec="seconds"),
                user=interaction.user.name, guild=getattr(interaction.guild, "name", None),
                channel=getattr(interaction.channel, "name", None),
@@ -216,6 +225,7 @@ async def summary(interaction: discord.Interaction, since: str | None = None,
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except OSError:
             log.exception("couldn't write %s", USAGE_LOG)
+        active -= 1
 
 
 def by_day(msgs: list[discord.Message]) -> list[tuple[dt.date, list[discord.Message]]]:
@@ -341,6 +351,9 @@ async def run_summary(interaction, rec, since, hours, days, count, big, public) 
         note = f"-# {model} · processed in {took}"
         if dropped:
             note += f" · oldest {dropped} messages of a very long day skipped"
+        # Benchmarked: both models misattribute who-said-what in most summaries.
+        note += ("\n-# ⚠️ AI-generated summary - it can get details and who said "
+                 "what wrong. Check the chat before relying on anything here.")
         if sections:
             sections[-1] += "\n" + note
         else:
@@ -362,6 +375,25 @@ async def on_ready():
     log.info("logged in as %s, ollama at %s", client.user, OLLAMA_URL)
 
 
+async def drain_and_close():
+    """SIGTERM (docker stop / redeploy): refuse new work, let running summaries
+    finish, then disconnect. compose's stop_grace_period must cover this."""
+    global shutting_down
+    shutting_down = True
+    log.info("SIGTERM - waiting for %d running summar%s", active, "y" if active == 1 else "ies")
+    while active:
+        await asyncio.sleep(1)
+    await client.close()
+
+
+async def main():
+    tasks = set()   # keep a reference so the drain task can't be garbage-collected
+    asyncio.get_running_loop().add_signal_handler(
+        signal.SIGTERM, lambda: tasks.add(asyncio.create_task(drain_and_close())))
+    async with client:
+        await client.start(TOKEN)
+
+
 if __name__ == "__main__":
     discord.utils.setup_logging(level=logging.INFO)
-    client.run(TOKEN, log_handler=None)
+    asyncio.run(main())
