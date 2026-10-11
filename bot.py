@@ -34,8 +34,17 @@ DEADLINE = 14 * 60      # Discord followup tokens die at 15 min
 
 PROMPT = """You summarise a Discord group chat for someone who missed it.
 
+Write it as a topic outline, in exactly this shape:
+
+**Topic name** - who was in it
+- one point per bullet, under ~20 words
+  - optional sub-point for a detail or reply
+**Next topic** - who was in it
+- ...
+
 Rules:
-- Group by topic, in the order topics came up. Short bullets, plain language.
+- Topics in the order they came up; merge small exchanges into a "Misc" topic at the end.
+- Bullets only - no paragraphs, no headings other than the bold topic lines.
 - Say who said what, using the names as written.
 - Keep jokes and banter as what they were; don't sanitise, moralise or editorialise.
 - Lines that are only a GIF, image or emoji carry no content - don't summarise them.
@@ -117,7 +126,27 @@ async def summarise(session: aiohttp.ClientSession, model: str, transcript: str,
             r.raise_for_status()
             data = await r.json()
     out = data["message"]["content"]
-    return re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
+    return outline(re.sub(r"<think>.*?</think>", "", out, flags=re.S))
+
+
+def outline(text: str) -> str:
+    """Coerce model output into the topic outline the prompt asks for.
+
+    Models drift: '##' headings (the bot owns headings), '*   ' bullets, ragged
+    indents. Discord renders '- ' and '  - ' cleanly, so normalise to those.
+    """
+    out = []
+    for line in text.strip().splitlines():
+        if not line.strip():
+            continue
+        if m := re.match(r"\s*#{1,6}\s+(.*)", line):
+            line = f"**{m[1].strip('* ')}**"
+        elif m := re.match(r"(\s*)[*\u2022+-]\s+(.*)", line):
+            line = ("  - " if len(m[1].expandtabs(4)) >= 2 else "- ") + m[2]
+        if line.startswith("**") and out:
+            out.append("")          # blank line before each topic
+        out.append(line.rstrip())
+    return "\n".join(out)
 
 
 def fit(lines: list[str]) -> tuple[list[str], int]:
@@ -143,8 +172,12 @@ def header(msgs: list[discord.Message]) -> str:
 
 def chunks(text: str, size: int = 1900):
     while text:
-        cut = text.rfind("\n", 0, size) if len(text) > size else len(text)
-        cut = cut if cut > 0 else size
+        if len(text) <= size:
+            cut = len(text)
+        else:   # prefer a topic boundary, so a heading never ends a message
+            cut = text.rfind("\n\n", 0, size)
+            cut = cut if cut > size // 3 else text.rfind("\n", 0, size)
+            cut = cut if cut > 0 else size
         yield text[:cut]
         text = text[cut:].lstrip("\n")
 

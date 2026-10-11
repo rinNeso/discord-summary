@@ -20,7 +20,9 @@ Discord ──▶ bot (HeilandBay, /mnt/apps/discord-summary/stack)
 | `big:true` | use `qwen3.5:122b-a10b` |
 | `public:true` | post to the channel instead of only to you |
 
-A window inside one calendar day gets a single summary. Anything longer gets
+Summaries are a **topic outline**: a bold topic line naming who was in it, then
+short bullets, with sub-bullets for details. The bot normalises whatever the
+model emits into that shape. A window inside one calendar day gets a single summary. Anything longer gets
 **one section per day**, posted as each finishes. The header (message count,
 span, who was talking) and the `processed in` footer come from the bot, not the
 model.
