@@ -1,0 +1,17 @@
+# Discord /summary bot. The LLM is ollama on hyperBox (192.168.0.208), so chat
+# text stays on the LAN. If hyperBox is off, the bot says so instead of failing.
+name: discord-summary
+services:
+  bot:
+    build: .
+    image: discord-summary:local
+    container_name: discord-summary
+    restart: unless-stopped
+    env_file: /mnt/apps/discord-summary/secrets/.env   # DISCORD_TOKEN, GUILD_ID - root-only
+    environment:
+      TZ: America/Chicago
+      OLLAMA_URL: http://192.168.0.208:11434
+      MODEL_FAST: qwen3.8:27b
+      MODEL_BIG: qwen3.5:122b-a10b
+    volumes:
+      - /mnt/apps/discord-summary/data:/data   # usage.jsonl - who/when/outcome, no message content

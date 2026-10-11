@@ -1,0 +1,9 @@
+.env
+*.env
+secrets/
+data/
+*.jsonl
+__pycache__/
+# benchmark inputs/outputs contain real chat - never commit
+bench/*.txt
+bench/*.html
