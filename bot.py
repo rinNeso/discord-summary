@@ -1,7 +1,9 @@
-"""Discord channel summariser.
+"""Discord channel summariser, Instagram link reposter, and voice-chat TTS.
 
-Runs on HeilandBay; the LLM runs on hyperBox (ollama). Chat text never leaves
-the LAN - the only outside traffic is to Discord itself.
+Runs on HeilandBay; the LLM runs on hyperBox (ollama), and TTS runs here (see
+tts.py). Chat text never leaves the LAN. Outside traffic is Discord itself, plus
+Instagram for any post someone links (see instagram.py) - only the link is
+fetched, nothing from the chat is sent.
 """
 import asyncio
 import datetime as dt
@@ -10,8 +12,10 @@ import logging
 import os
 import re
 import signal
+import tempfile
 import time
 from collections import Counter
+from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -21,6 +25,9 @@ import random
 from discord import app_commands
 from discord.ext import tasks
 
+import instagram
+import tts
+
 TOKEN = os.environ["DISCORD_TOKEN"]
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://192.168.0.208:11434").rstrip("/")
 MODEL_FAST = os.environ.get("MODEL_FAST", "qwen3.8:27b")
@@ -28,6 +35,15 @@ MODEL_BIG = os.environ.get("MODEL_BIG", "qwen3.5:122b-a10b")
 GUILD_ID = os.environ.get("GUILD_ID")          # set = instant command sync to that server
 USAGE_LOG = os.environ.get("USAGE_LOG", "/data/usage.jsonl")   # who/when/outcome, never content
 TZ = ZoneInfo(os.environ.get("TZ", "America/Chicago"))
+INSTAGRAM = os.environ.get("INSTAGRAM", "1") == "1"   # repost Instagram links as files
+# /tts is locked to one voice channel: the bot joins only it and reads only its
+# built-in text chat (same ID). The commands are registered in that server alone,
+# so nobody elsewhere even sees them. Either unset = /tts off.
+TTS_GUILD = int(os.environ.get("TTS_GUILD") or 0)
+TTS_CHANNEL = int(os.environ.get("TTS_CHANNEL") or 0)
+# Only these user IDs (comma-separated) may use it; empty = nobody. Added after
+# an open free-for-all was abused within minutes.
+TTS_USERS = {int(u) for u in os.environ.get("TTS_USERS", "").split(",") if u.strip()}
 
 MAX_COUNT = 5000        # cap for count=; time windows fetch everything in range
 MAX_FETCH = 10_000      # hard stop on history fetch for any request
@@ -35,6 +51,9 @@ MAX_CHARS = 70_000      # per model call; chat runs ~2.5 chars/token, so ~28k of
 NUM_CTX = 32768
 LLM_TIMEOUT = 600       # 122B on a long transcript can take minutes
 DEADLINE = 14 * 60      # Discord followup tokens die at 15 min
+IG_TIMEOUT = 180        # per Instagram link: download plus any re-encode
+IG_MAX_LINKS = 3        # per message, so a pasted list can't flood the channel
+TTS_QUEUE = 8           # messages waiting to be spoken, per server
 
 PROMPT = """You summarise a Discord group chat for someone who missed it.
 
@@ -65,6 +84,9 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 llm_lock = asyncio.Lock()
 active = 0              # summaries in progress - SIGTERM waits for these
+ig_jobs = 0             # Instagram reposts in progress - SIGTERM waits for these too
+ig_sem = asyncio.Semaphore(2)
+warned_perms: set[int] = set()  # channels already told about a missing permission
 
 # Rotating custom statuses. Edit freely - one is picked every STATUS_EVERY minutes.
 STATUS_EVERY = 15
@@ -253,15 +275,20 @@ async def summary(interaction: discord.Interaction, since: str | None = None,
         raise
     finally:
         rec["secs"] = round(time.monotonic() - t0, 1)
-        log.info("usage %s", json.dumps(rec, ensure_ascii=False))
-        try:
-            with open(USAGE_LOG, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except OSError:
-            log.exception("couldn't write %s", USAGE_LOG)
+        record(rec)
         active -= 1
         if not active:
             await set_status(random.choice(STATUSES))
+
+
+def record(rec: dict):
+    """Append to the usage log: who, when, options, outcome - never content."""
+    log.info("usage %s", json.dumps(rec, ensure_ascii=False))
+    try:
+        with open(USAGE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        log.exception("couldn't write %s", USAGE_LOG)
 
 
 def by_day(msgs: list[discord.Message]) -> list[tuple[dt.date, list[discord.Message]]]:
@@ -400,6 +427,292 @@ async def run_summary(interaction, rec, since, hours, days, count, big, public) 
     return "ok"
 
 
+@dataclass
+class Speaker:
+    channel_id: int         # the text channel whose messages get read out
+    voice: str
+    since: float = field(default_factory=time.monotonic)
+    spoken: int = 0
+
+
+@dataclass
+class VoiceSession:
+    """One per server: a bot can only be in one voice channel per server."""
+    vc: discord.VoiceClient
+    speakers: dict[int, Speaker] = field(default_factory=dict)
+    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(TTS_QUEUE))
+    task: asyncio.Task | None = None
+
+
+voice_sessions: dict[int, VoiceSession] = {}
+
+tts_group = app_commands.Group(
+    name="tts", description="Read your messages aloud in voice chat, for when you have no mic",
+    guild_only=True)
+if TTS_GUILD and TTS_CHANNEL:
+    tree.add_command(tts_group, guild=discord.Object(id=TTS_GUILD))
+
+
+@tts_group.command(name="start",
+                   description="Read what you type in this voice channel's chat aloud")
+@app_commands.describe(voice="Which voice reads your messages")
+@app_commands.choices(voice=[app_commands.Choice(name=n, value=v) for n, v in
+                             [("Lessac (default)", "lessac"), ("Amy", "amy"), ("Ryan", "ryan")]])
+async def tts_start(interaction: discord.Interaction, voice: str = tts.DEFAULT_VOICE):
+    rec = dict(ts=dt.datetime.now(TZ).isoformat(timespec="seconds"), kind="tts",
+               user=interaction.user.name, guild=interaction.guild.name, voice=voice)
+    reply = interaction.response.send_message
+    if shutting_down:
+        await reply("I'm restarting for an update - try again in a minute.", ephemeral=True)
+        return
+    vchan = interaction.guild.get_channel(TTS_CHANNEL)
+    if interaction.user.id not in TTS_USERS:
+        record(dict(rec, outcome="not_allowed"))
+        await reply("TTS is only switched on for specific people - ask Rin if you need it.",
+                    ephemeral=True)
+        return
+    if interaction.guild.id != TTS_GUILD or not vchan:
+        await reply("TTS isn't available here.", ephemeral=True)
+        return
+    if interaction.channel.id != TTS_CHANNEL:
+        await reply(f"TTS only works in {vchan.mention}'s own chat - open the voice "
+                    "channel's chat and run it there.", ephemeral=True)
+        return
+    if not interaction.user.voice or interaction.user.voice.channel != vchan:
+        await reply(f"Join {vchan.mention} first, then run this again.", ephemeral=True)
+        return
+    rec["channel"] = vchan.name
+    perms = vchan.permissions_for(interaction.guild.me)
+    if not (perms.connect and perms.speak):
+        record(dict(rec, outcome="no_permission"))
+        await reply(f"I need the **Connect** and **Speak** permissions in {vchan.mention}.",
+                    ephemeral=True)
+        return
+    sess = voice_sessions.get(interaction.guild.id)
+    if not sess:
+        await interaction.response.defer(thinking=True)
+        reply = interaction.followup.send
+        try:
+            vc = await vchan.connect(self_deaf=True, timeout=20)
+        except (asyncio.TimeoutError, discord.ClientException) as e:
+            log.warning("voice connect failed: %r", e)
+            record(dict(rec, outcome="connect_failed"))
+            await reply("Couldn't join the voice channel - try again in a moment.",
+                        ephemeral=True)
+            return
+        sess = voice_sessions[interaction.guild.id] = VoiceSession(vc)
+        sess.task = asyncio.create_task(speak_loop(sess))
+    old = sess.speakers.get(interaction.user.id)
+    sess.speakers[interaction.user.id] = Speaker(interaction.channel.id, voice)
+    if old:     # re-running it just changes the voice
+        sess.speakers[interaction.user.id].since = old.since
+        sess.speakers[interaction.user.id].spoken = old.spoken
+    await reply(f"🔊 Reading **{discord.utils.escape_markdown(interaction.user.display_name)}**'s "
+                f"messages in this chat aloud.\n"
+                "-# `/tts stop` to end it. Links, emoji-only messages and anything "
+                "starting with `//` are skipped.",
+                allowed_mentions=discord.AllowedMentions.none())
+
+
+@tts_group.command(name="stop", description="Stop reading your messages aloud")
+async def tts_stop(interaction: discord.Interaction):
+    sess = voice_sessions.get(interaction.guild.id)
+    if not sess or interaction.user.id not in sess.speakers:
+        await interaction.response.send_message("I wasn't reading your messages.",
+                                                ephemeral=True)
+        return
+    await interaction.response.send_message("🔇 Stopped reading your messages.", ephemeral=True)
+    await drop_speaker(sess, interaction.user.id, "stopped")
+
+
+async def drop_speaker(sess: VoiceSession, user_id: int, outcome: str):
+    sp = sess.speakers.pop(user_id, None)
+    if sp:
+        member = sess.vc.guild.get_member(user_id)
+        record(dict(ts=dt.datetime.now(TZ).isoformat(timespec="seconds"), kind="tts",
+                    user=member.name if member else str(user_id), guild=sess.vc.guild.name,
+                    channel=getattr(sess.vc.channel, "name", None), voice=sp.voice,
+                    outcome=outcome, messages=sp.spoken,
+                    secs=round(time.monotonic() - sp.since)))
+    if not sess.speakers:
+        await end_session(sess, outcome)
+
+
+async def end_session(sess: VoiceSession, outcome: str):
+    guild = sess.vc.guild
+    if voice_sessions.get(guild.id) is not sess:
+        return              # already ended
+    del voice_sessions[guild.id]
+    for uid in list(sess.speakers):
+        await drop_speaker(sess, uid, outcome)    # logs each; session's already gone
+    if sess.task and sess.task is not asyncio.current_task():
+        sess.task.cancel()
+    if sess.vc.is_connected():
+        await sess.vc.disconnect()
+
+
+async def speak_loop(sess: VoiceSession):
+    loop = asyncio.get_running_loop()
+    while True:
+        user_id, text = await sess.queue.get()
+        sp = sess.speakers.get(user_id)
+        if not sp or not sess.vc.is_connected():
+            continue
+        member = sess.vc.guild.get_member(user_id)
+        if member:          # always, so the VC knows who's typing
+            text = f"{member.display_name} says: {text}"
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", prefix="tts-") as f:
+                await asyncio.to_thread(tts.synth, text, sp.voice, f.name)
+                done = asyncio.Event()
+                sess.vc.play(discord.FFmpegPCMAudio(f.name, options="-loglevel error"),
+                             after=lambda e: loop.call_soon_threadsafe(done.set))
+                await done.wait()
+            sp.spoken += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception:   # one bad message mustn't kill the session
+            log.exception("tts playback failed")
+
+
+async def tts_message(message: discord.Message):
+    sess = voice_sessions.get(message.guild.id)
+    sp = sess and sess.speakers.get(message.author.id)
+    if (not sp or message.author.id not in TTS_USERS
+            or message.channel.id != TTS_CHANNEL or message.channel.id != sp.channel_id
+            or message.content.startswith("//")):
+        return
+    text = tts.speakable(message.clean_content)
+    if not text:
+        return
+    try:
+        sess.queue.put_nowait((message.author.id, text))
+    except asyncio.QueueFull:   # typing faster than it can talk: drop, don't lag minutes behind
+        log.info("tts queue full in %s, dropped a message", message.guild.name)
+
+
+@client.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState,
+                                after: discord.VoiceState):
+    sess = voice_sessions.get(member.guild.id)
+    if not sess:
+        return
+    if member == member.guild.me:
+        if after.channel is None:       # kicked, or the channel was deleted
+            await end_session(sess, "disconnected")
+        elif after.channel.id != TTS_CHANNEL:   # dragged elsewhere: never read there
+            await end_session(sess, "moved")
+        return
+    here = sess.vc.channel
+    if member.id in sess.speakers and after.channel != here:
+        await drop_speaker(sess, member.id, "left_voice")
+    elif voice_sessions.get(member.guild.id) is sess and not any(
+            not m.bot for m in here.members):
+        await end_session(sess, "channel_empty")
+
+
+@client.event
+async def on_message(message: discord.Message):
+    """Read out /tts speakers' messages; repost Instagram links as attachments."""
+    if shutting_down or message.author.bot or not message.guild:
+        return
+    await tts_message(message)
+    if not INSTAGRAM:
+        return
+    links = instagram.find_links(message.content)
+    if not links:
+        return
+    perms = message.channel.permissions_for(message.guild.me)
+    if not (perms.send_messages and perms.attach_files):
+        # Say so once per channel, rather than silently doing nothing forever.
+        if perms.send_messages and message.channel.id not in warned_perms:
+            warned_perms.add(message.channel.id)
+            await message.channel.send("-# I'd repost that Instagram link for people "
+                                       "without an account, but I need the **Attach "
+                                       "Files** permission in this channel.")
+        return
+    for link in links[:IG_MAX_LINKS]:
+        await repost(message, link)
+
+
+async def ig_reply(message: discord.Message, content: str | None = None, files=None):
+    # Captions are user text: an "@everyone" in one must not ping the server.
+    await message.channel.send(
+        content, files=files or None, mention_author=False,
+        reference=message.to_reference(fail_if_not_exists=False),
+        allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True)
+
+
+def ig_caption(post: instagram.Post, spoiler: bool) -> str:
+    who = discord.utils.escape_markdown(f"@{post.author}" if post.author else "Instagram")
+    cap = " ".join(post.caption.split())
+    if len(cap) > 200:
+        cap = cap[:199].rstrip() + "…"
+    line = f"-# 📸 **{who}**"
+    if cap:
+        cap = discord.utils.escape_markdown(cap)
+        line += f" · ||{cap}||" if spoiler else f" · {cap}"
+    return line
+
+
+IG_UNAVAILABLE = {
+    "private": "-# That Instagram post is from a private account, so it can't be reposted.",
+    "restricted": "-# That Instagram post is age-restricted, and the bot couldn't get past it.",
+    "other": "-# Couldn't fetch that Instagram post - it may be deleted, or Instagram "
+             "is refusing for now.",
+}
+
+
+async def repost(message: discord.Message, link: instagram.Link):
+    global ig_jobs
+    ig_jobs += 1
+    rec = dict(ts=dt.datetime.now(TZ).isoformat(timespec="seconds"), kind="instagram",
+               user=message.author.name, guild=message.guild.name,
+               channel=getattr(message.channel, "name", None), outcome="crash")
+    t0 = time.monotonic()
+    limit = message.guild.filesize_limit     # 10 MiB unboosted, more with boosts
+    try:
+        async with ig_sem:
+            with tempfile.TemporaryDirectory(prefix="ig-") as tmp:
+                try:
+                    async with message.channel.typing():
+                        post = await asyncio.wait_for(
+                            asyncio.to_thread(instagram.fetch, link, tmp, limit), IG_TIMEOUT)
+                except instagram.Unavailable as e:
+                    log.info("instagram unavailable: %s", e)
+                    rec.update(outcome="unavailable", reason=e.reason)
+                    await ig_reply(message, IG_UNAVAILABLE[e.reason])
+                    return
+                except asyncio.TimeoutError:
+                    rec["outcome"] = "timeout"
+                    await ig_reply(message, "-# That Instagram post took too long to fetch.")
+                    return
+                rec.update(items=len(post.media), logged_in=post.logged_in,
+                           videos=sum(m.kind == "video" for m in post.media),
+                           compressed=sum(m.compressed for m in post.media),
+                           too_big=post.too_big,
+                           mb=round(sum(os.path.getsize(m.path) for m in post.media) / 2**20, 1))
+                text = ig_caption(post, link.spoiler)
+                if post.too_big:
+                    text += (f"\n-# {post.too_big} video{'s' if post.too_big > 1 else ''} "
+                             f"too long to fit under this server's {limit >> 20} MB upload limit.")
+                groups = instagram.batches(post.media, limit)
+                for i, group in enumerate(groups or [[]]):
+                    files = [discord.File(m.path, filename=os.path.basename(m.path),
+                                          spoiler=link.spoiler) for m in group]
+                    await ig_reply(message, text if i == 0 else None, files)
+                rec["outcome"] = "ok" if post.media else "too_big"
+    except discord.HTTPException as e:
+        log.warning("instagram repost: Discord refused the upload: %s", e)
+        rec["outcome"] = "send_failed"
+    except Exception:
+        log.exception("instagram repost crashed")
+    finally:
+        rec["secs"] = round(time.monotonic() - t0, 1)
+        record(rec)
+        ig_jobs -= 1
+
+
 @client.event
 async def on_ready():
     if GUILD_ID:
@@ -408,9 +721,12 @@ async def on_ready():
         await tree.sync(guild=guild)
     else:
         await tree.sync()
+    if TTS_GUILD:   # with TTS_CHANNEL unset this syncs nothing, removing /tts there
+        await tree.sync(guild=discord.Object(id=TTS_GUILD))
     log.info("logged in as %s, ollama at %s", client.user, OLLAMA_URL)
     if not rotate_status.is_running():
         rotate_status.start()
+    await asyncio.to_thread(tts.preload)     # ~2s per voice, so not on someone's first message
 
 
 async def set_status(text: str):
@@ -431,8 +747,11 @@ async def drain_and_close():
     finish, then disconnect. compose's stop_grace_period must cover this."""
     global shutting_down
     shutting_down = True
-    log.info("SIGTERM - waiting for %d running summar%s", active, "y" if active == 1 else "ies")
-    while active:
+    for sess in list(voice_sessions.values()):   # nothing to finish; just log and leave
+        await end_session(sess, "shutdown")
+    log.info("SIGTERM - waiting for %d running summar%s and %d repost%s", active,
+             "y" if active == 1 else "ies", ig_jobs, "" if ig_jobs == 1 else "s")
+    while active or ig_jobs:
         await asyncio.sleep(1)
     await client.close()
 

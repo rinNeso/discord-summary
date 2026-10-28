@@ -8,11 +8,17 @@ services:
     container_name: discord-summary
     restart: unless-stopped
     stop_grace_period: 16m   # bot finishes running summaries on SIGTERM; a DM week can take ~6 min
-    env_file: /mnt/apps/discord-summary/secrets/.env   # DISCORD_TOKEN, GUILD_ID - root-only
+    env_file: /mnt/apps/discord-summary/secrets/.env   # DISCORD_TOKEN, GUILD_ID, TTS_* - root-only
     environment:
       TZ: America/Chicago
       OLLAMA_URL: http://192.168.0.208:11434
       MODEL_FAST: qwen3.8:27b
       MODEL_BIG: qwen3.5:122b-a10b
+      INSTAGRAM: "1"         # repost Instagram links as attachments; "0" turns it off
+      # /tts reads TTS_GUILD and TTS_CHANNEL (the one voice channel it serves) and
+      # TTS_USERS (allowlisted user IDs, comma-separated) from the env_file above,
+      # so server, channel and member IDs stay out of the repo. Open to everyone it
+      # was abused within minutes (2026-10-21), so it's allowlist-only.
     volumes:
       - /mnt/apps/discord-summary/data:/data   # usage.jsonl - who/when/outcome, no message content
+      - /mnt/apps/discord-summary/instagram:/instagram:ro   # cookies.txt from ig-login.sh (optional)
